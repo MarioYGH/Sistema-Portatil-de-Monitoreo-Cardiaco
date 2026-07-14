@@ -1,0 +1,311 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8"/>
+  <title>ECG Monitor</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+
+  <style>
+    :root{
+      --bg:#0a0f1e;
+      --card:#0f162c;
+      --edge:#1d2a4a;
+      --text:#e8eef7;
+      --muted:#9ab0cc;
+      --accent:#6c8cff;
+      --accent-2:#b259ff;
+      --accent-3:#2dd4bf;
+      --shadow: 0 10px 30px rgba(0,0,0,.35);
+      --radius: 18px;
+    }
+
+    *{box-sizing:border-box}
+    html,body{height:100%}
+    body{
+      margin:0; color:var(--text); background:
+        radial-gradient(1200px 700px at 10% -10%, #141f3d 0%, transparent 60%),
+        radial-gradient(1000px 600px at 100% 0%, #1a0f2b 0%, transparent 55%),
+        linear-gradient(180deg, #0a0f1e 0%, #070b16 100%);
+      min-height:100%;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Inter, "Helvetica Neue", Arial, "Noto Sans", "Liberation Sans", sans-serif;
+    }
+
+    .wrap{max-width:1150px;margin:24px auto;padding:0 18px}
+    .grid{
+      display:grid;
+      grid-template-columns: repeat(12, 1fr);
+      gap:16px;
+    }
+
+    .card{
+      background:linear-gradient(160deg, rgba(255,255,255,.04), rgba(255,255,255,.02));
+      border:1px solid var(--edge);
+      border-radius:var(--radius);
+      box-shadow: var(--shadow);
+      padding:18px;
+      position:relative;
+      overflow:hidden;
+    }
+
+    .card::before{
+      content:"";
+      position:absolute; inset:-2px -2px auto auto; width:160px; height:160px;
+      background: radial-gradient(closest-side, rgba(108,140,255,.18), transparent 70%);
+      border-radius:50%;
+      filter: blur(10px);
+      transform: translate(40px,-40px);
+      pointer-events:none;
+    }
+
+    h1{font-size:28px; margin:0 0 4px}
+    .hero-sub{color:var(--muted); margin:0}
+    .metric-title{color:var(--muted); font-weight:600; letter-spacing:.4px; font-size:12px}
+    .metric-big{font-size:28px; font-weight:700; margin-top:6px}
+    .metric-note{color:var(--muted); font-size:12px; margin-top:4px}
+
+    .pill{
+      display:inline-flex; align-items:center; gap:8px;
+      padding:8px 12px; border-radius:999px;
+      background: linear-gradient(90deg, rgba(108,140,255,.18), rgba(178,89,255,.18));
+      border:1px solid rgba(255,255,255,.08);
+      font-size:12px; color:var(--text);
+    }
+
+    .row{display:flex; gap:10px; flex-wrap:wrap}
+    .dim{color:var(--muted)}
+    canvas{width:100% !important; height:320px !important; background:#0c1224; border-radius:14px; border:1px solid var(--edge)}
+
+    /* Layout */
+    .col-12{grid-column: span 12}
+    .col-8{grid-column: span 8}
+    .col-6{grid-column: span 6}
+    .col-4{grid-column: span 4}
+    .col-3{grid-column: span 3}
+    .col-2{grid-column: span 2}
+
+    @media (max-width: 980px){
+      .col-8{grid-column: span 12}
+      .col-6{grid-column: span 12}
+      .col-4{grid-column: span 6}
+      .col-3{grid-column: span 6}
+      .col-2{grid-column: span 6}
+      canvas{height:260px !important}
+    }
+
+    /* Tiny status dots */
+    .dot{width:8px;height:8px;border-radius:50%;display:inline-block}
+    .ok{background:linear-gradient(180deg,#2dd4bf,#1aa89a); box-shadow:0 0 10px #2dd4bf55}
+    .warn{background:linear-gradient(180deg,#f59e0b,#b45309)}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="grid">
+      <!-- Hero -->
+      <div class="card col-8">
+        <div class="row" style="align-items:center; justify-content:space-between">
+          <div>
+            <h1>ECG Monitor</h1>
+            <p class="hero-sub">Clasificación en tiempo real • NB-IoT → Django (SSE)</p>
+          </div>
+          <div class="pill"><span class="dot ok"></span><span id="status">Esperando datos…</span></div>
+        </div>
+        <div style="height:18px"></div>
+        <div class="row">
+          <div>
+            <div class="metric-title"> Ritmo </div>
+            <div class="metric-big" id="m-bpm">– –</div>
+            <div class="metric-note" id="m-label">—</div>
+          </div>
+          <div>
+            <div class="metric-title"> Latencia de inferencia </div>
+            <div class="metric-big" id="m-lat">– ms</div>
+            <div class="metric-note dim">último lote</div>
+          </div>
+          <div>
+            <div class="metric-title"> Dispositivo </div>
+            <div class="metric-big" id="m-dev">–</div>
+            <div class="metric-note" id="m-ts">—</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- KPIs -->
+      <div class="card col-4">
+        <div class="metric-title">Estado del análisis</div>
+        <div class="metric-big" id="m-status">Normal</div>
+        <div class="metric-note">Conf.: <span id="m-score">—</span></div>
+        <div style="height:12px"></div>
+        <div class="metric-title">Frecuencia de muestreo</div>
+        <div class="metric-big" id="m-fs">— Hz</div>
+        <div class="metric-note">Canal: ECG Lead</div>
+      </div>
+
+      <!-- ECG chart -->
+      <div class="card col-8">
+        <div class="row" style="justify-content:space-between; align-items:center; margin-bottom:10px">
+          <div class="metric-title">ECG Recording (último paquete)</div>
+          <div class="dim" style="font-size:12px">Auto downsample a ~250 pts</div>
+        </div>
+        <canvas id="ecg"></canvas>
+      </div>
+
+      <!-- BPM trend -->
+      <div class="card col-4">
+        <div class="row" style="justify-content:space-between; align-items:center; margin-bottom:10px">
+          <div class="metric-title">Tendencia BPM</div>
+          <div class="dim" style="font-size:12px">últimos 50</div>
+        </div>
+        <canvas id="bpm"></canvas>
+      </div>
+
+      <!-- Info -->
+      <div class="card col-12">
+        <div class="row" style="gap:20px">
+          <div class="dim">Endpoint ingest: <code>/api/ingest</code></div>
+          <div class="dim">Header: <code>X-Device-Token</code></div>
+          <div class="dim">Stream SSE: <code>/stream/sse</code></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+<pre id="debug" style="color:#9ab0cc; font-size:11px; max-height:120px; overflow:auto; background:rgba(0,0,0,.25); padding:6px; border-radius:8px; margin-top:12px;"></pre>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<script>
+  let ecgChart, bpmChart;
+  const bpmSeries = [];
+  let usingPolling = false;
+  let pollTimer = null;
+
+  function mkLine(ctx, label){
+    return new Chart(ctx,{
+      type:'line',
+      data:{labels:[], datasets:[{label, data:[], pointRadius:0, borderWidth:1, tension:.25}]},
+      options:{
+        animation:false,
+        responsive:true,
+        plugins:{ legend:{ display:false } },
+        scales:{
+          x:{ grid:{color:'rgba(255,255,255,.04)'}, display:false },
+          y:{ grid:{color:'rgba(255,255,255,.06)'} }
+        }
+      }
+    });
+  }
+
+  function initCharts(){
+    if(ecgChart && bpmChart) return;
+    ecgChart = mkLine(document.getElementById('ecg'), 'ECG');
+    bpmChart = mkLine(document.getElementById('bpm'), 'BPM');
+  }
+
+  function fmtPct(x){ return (x*100).toFixed(1)+'%'; }
+
+  function updateDash(pkt){
+    if(!pkt || typeof pkt !== 'object') return;
+    
+    const dbg = document.getElementById('debug');
+	  if (dbg) {
+		dbg.textContent = JSON.stringify(pkt, null, 2);
+	  }
+
+    document.getElementById('status').textContent = usingPolling ? 'Polling activo' : 'SSE activo';
+    document.getElementById('m-bpm').textContent  = (pkt.bpm ?? pkt.b ?? '—');
+    document.getElementById('m-lat').textContent  = (pkt.lat_ms ?? 0) + ' ms';
+    document.getElementById('m-dev').textContent  = pkt.id ?? '—';
+    document.getElementById('m-ts').textContent   = pkt.ts ?? '—';
+    document.getElementById('m-label').textContent= `${pkt.label ?? '—'} (${fmtPct(pkt.score ?? 0)})`;
+    document.getElementById('m-status').textContent = (pkt.label ?? '—');
+    document.getElementById('m-score').textContent  = fmtPct(pkt.score ?? 0);
+    document.getElementById('m-fs').textContent     = (pkt.fs ?? '-') + ' Hz';
+
+    const data = pkt.e || [];
+    ecgChart.data.labels = data.map((_,i)=>i);
+    ecgChart.data.datasets[0].data = data;
+    ecgChart.update();
+
+    const bpmVal = (typeof pkt.bpm === 'number') ? pkt.bpm :
+                   (typeof pkt.b === 'number') ? pkt.b : null;
+    if(bpmVal !== null){
+      bpmSeries.push(bpmVal);
+      if(bpmSeries.length>50) bpmSeries.shift();
+      bpmChart.data.labels = bpmSeries.map((_,i)=>i);
+      bpmChart.data.datasets[0].data = bpmSeries;
+      bpmChart.update();
+    }
+  }
+
+  async function pollOnce(){
+    try{
+      const resp = await fetch('/api/latest?k=1', { cache: 'no-store' });
+      if(!resp.ok) return;
+      const json = await resp.json();
+      const items = json.items || [];
+      if(items.length > 0){
+        updateDash(items[items.length - 1]);
+      }
+    }catch(e){
+      // silencioso
+    }
+  }
+
+  function startPolling(){
+    if(usingPolling) return;
+    usingPolling = true;
+    document.getElementById('status').textContent = 'Polling activo';
+    if(pollTimer) clearInterval(pollTimer);
+    pollTimer = setInterval(pollOnce, 2000);
+    pollOnce();
+  }
+
+  function startSSE(){
+    if(!('EventSource' in window)){
+      startPolling();
+      return;
+    }
+
+    let errorCount = 0;
+    const es = new EventSource('/stream/sse');
+
+    es.addEventListener('ecg', ev => {
+      errorCount = 0;
+      try{
+        const pkt = JSON.parse(ev.data);
+        updateDash(pkt);
+      }catch(e){}
+    });
+
+    es.onopen = () => {
+      errorCount = 0;
+      document.getElementById('status').textContent = 'SSE activo';
+    };
+
+    es.onerror = () => {
+      errorCount++;
+      document.getElementById('status').textContent = 'SSE desconectado';
+      if(errorCount >= 3){
+        es.close();
+        startPolling();
+      }
+    };
+  }
+
+  function bootstrap(){
+    initCharts();
+    const host = window.location.hostname || "";
+    // Si estamos detrás de trycloudflare, forzamos polling
+    if(host.endsWith('trycloudflare.com')){
+      startPolling();
+    }else{
+      startSSE();
+    }
+  }
+
+  // script está al final del body, el DOM ya está cargado
+  bootstrap();
+</script>
+
+</body>
+</html>
