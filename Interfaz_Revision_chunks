@@ -1,0 +1,459 @@
+"""
+Interfaz ECG para revisar los chunks enviados desde el ESP32
+ECG MQTT Frame Viewer (Tkinter + Matplotlib)
+Soporta:
+- Payload HEX (header + float32)  [legacy]
+- Payload Base64 (header + int16) [actual, según tu Completo.c]
+
+Header C (packed) = 21 bytes:
+typedef struct __attribute__((packed)) {
+  uint32_t device_id;      // 4
+  uint16_t year;           // 2
+  uint8_t  month, date, hours, minutes, seconds; // 5
+  uint16_t window_seq;     // 2
+  uint16_t chunk_seq;      // 2
+  uint16_t fs_hz;          // 2
+  uint8_t  lead_id;        // 1
+  uint8_t  encoding;       // 1   0=float32, 1=int16
+  uint16_t n_samples;      // 2
+} ecg_chunk_header_t;      // TOTAL = 21 bytes
+"""
+
+import re
+import struct
+import base64
+import binascii
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+
+import numpy as np
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+from matplotlib.figure import Figure
+
+
+HEADER_SIZE = 21
+HDR_FMT = "<I H 5B H H H B B H"   # little-endian packed
+assert struct.calcsize(HDR_FMT) == HEADER_SIZE
+
+ENC_FLOAT32 = 0
+ENC_INT16   = 1
+
+
+# =============================================================================
+#  Helpers: detect / decode payload to raw bytes
+# =============================================================================
+def _clean_hex(s: str) -> str:
+    s = s.strip().replace("0x", "").replace("0X", "")
+    s = re.sub(r"[^0-9a-fA-F]", "", s)
+    return s
+
+def _looks_like_hex(s: str) -> bool:
+    s2 = _clean_hex(s)
+    return len(s2) >= 2 and (len(s2) % 2 == 0) and re.fullmatch(r"[0-9a-fA-F]+", s2) is not None
+
+def _decode_hex_to_bytes(s: str) -> bytes:
+    s2 = _clean_hex(s)
+    if len(s2) == 0:
+        raise ValueError("Payload vacío tras limpieza HEX.")
+    if len(s2) % 2 != 0:
+        raise ValueError("Longitud HEX impar.")
+    return bytes.fromhex(s2)
+
+def _decode_b64_to_bytes(s: str) -> bytes:
+    # quitar espacios/saltos de línea
+    s2 = re.sub(r"\s+", "", s.strip())
+    if not s2:
+        raise ValueError("Payload vacío tras limpieza Base64.")
+    try:
+        return base64.b64decode(s2, validate=True)
+    except binascii.Error:
+        # algunos brokers/paths meten padding raro; reintento sin validate
+        try:
+            return base64.b64decode(s2, validate=False)
+        except Exception as e:
+            raise ValueError(f"Base64 inválido: {e}")
+
+
+# =============================================================================
+#  Decode: raw bytes -> (header, samples_float)
+# =============================================================================
+def decode_ecg_payload(payload: str, mode: str = "auto", int16_scale: float = 10000.0):
+    """
+    mode: "auto" | "hex" | "b64"
+    Devuelve:
+      header: dict
+      samples: np.ndarray float32 (ya en float para graficar)
+    """
+    if not isinstance(payload, str):
+        raise ValueError("El payload debe ser un string.")
+
+    if mode not in ("auto", "hex", "b64"):
+        raise ValueError("mode debe ser auto|hex|b64")
+
+    if mode == "hex":
+        raw = _decode_hex_to_bytes(payload)
+    elif mode == "b64":
+        raw = _decode_b64_to_bytes(payload)
+    else:
+        # auto: intenta hex si tiene pinta; si no, base64
+        if _looks_like_hex(payload):
+            raw = _decode_hex_to_bytes(payload)
+        else:
+            raw = _decode_b64_to_bytes(payload)
+
+    if len(raw) < HEADER_SIZE:
+        raise ValueError(f"Payload demasiado corto: {len(raw)} bytes, mínimo {HEADER_SIZE} bytes.")
+
+    (
+        device_id,
+        year,
+        month, date, hours, minutes, seconds,
+        window_seq,
+        chunk_seq,
+        fs_hz,
+        lead_id,
+        encoding,
+        n_samples
+    ) = struct.unpack_from(HDR_FMT, raw, 0)
+
+    if n_samples == 0:
+        raise ValueError("n_samples=0 (no hay datos).")
+
+    data = raw[HEADER_SIZE:]
+
+    # Decodificar según encoding
+    if encoding == ENC_FLOAT32:
+        needed = int(n_samples) * 4
+        if len(data) < needed:
+            raise ValueError(f"Faltan bytes: float32 requiere {needed}, hay {len(data)}.")
+        data = data[:needed]
+        samples = np.frombuffer(data, dtype="<f4").astype(np.float32)
+
+        y_label = "amplitud (float32)"
+        scale_used = None
+
+    elif encoding == ENC_INT16:
+        needed = int(n_samples) * 2
+        if len(data) < needed:
+            raise ValueError(f"Faltan bytes: int16 requiere {needed}, hay {len(data)}.")
+        data = data[:needed]
+        q = np.frombuffer(data, dtype="<i2")  # int16 LE
+        if int16_scale <= 0:
+            raise ValueError("int16_scale debe ser > 0")
+        samples = (q.astype(np.float32) / float(int16_scale))
+
+        y_label = f"amplitud (int16/{int16_scale:g})"
+        scale_used = float(int16_scale)
+    else:
+        raise ValueError(f"encoding desconocido: {encoding} (esperado 0=float32, 1=int16)")
+
+    header = {
+        "device_id": device_id,
+        "year": year,
+        "month": month,
+        "date": date,
+        "hours": hours,
+        "minutes": minutes,
+        "seconds": seconds,
+        "window_seq": window_seq,
+        "chunk_seq": chunk_seq,
+        "fs_hz": fs_hz,
+        "lead_id": lead_id,
+        "encoding": encoding,
+        "n_samples": n_samples,
+        "total_bytes": len(raw),
+        "header_bytes": HEADER_SIZE,
+        "data_bytes": needed,
+        "extra_bytes": len(raw) - (HEADER_SIZE + needed),
+        "y_label": y_label,
+        "scale_used": scale_used,
+    }
+    return header, samples
+
+
+# =============================================================================
+#  GUI
+# =============================================================================
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("ECG MQTT Frame Viewer (HEX/Base64)")
+        self.geometry("1150x720")
+        self.minsize(1050, 650)
+
+        self._samples = None
+        self._header = None
+
+        self._build_ui()
+        self._build_plot()
+
+    def _build_ui(self):
+        self.columnconfigure(0, weight=2)
+        self.columnconfigure(1, weight=3)
+        self.rowconfigure(0, weight=1)
+
+        left = ttk.Frame(self, padding=10)
+        right = ttk.Frame(self, padding=10)
+        left.grid(row=0, column=0, sticky="nsew")
+        right.grid(row=0, column=1, sticky="nsew")
+
+        left.rowconfigure(2, weight=1)
+        left.columnconfigure(0, weight=1)
+
+        ttk.Label(left, text="Pega aquí el payload MQTT (Base64 o HEX):").grid(row=0, column=0, sticky="w")
+
+        self.txt = tk.Text(left, height=16, wrap="word")
+        self.txt.grid(row=1, column=0, sticky="nsew", pady=(6, 6))
+
+        # --- opciones decode ---
+        opts = ttk.Frame(left)
+        opts.grid(row=2, column=0, sticky="ew")
+        opts.columnconfigure(6, weight=1)
+
+        ttk.Label(opts, text="Modo:").grid(row=0, column=0, sticky="w")
+        self.decode_mode = tk.StringVar(value="auto")
+        ttk.Radiobutton(opts, text="Auto", value="auto", variable=self.decode_mode).grid(row=0, column=1, padx=(6, 0))
+        ttk.Radiobutton(opts, text="Base64", value="b64", variable=self.decode_mode).grid(row=0, column=2, padx=(6, 0))
+        ttk.Radiobutton(opts, text="HEX", value="hex", variable=self.decode_mode).grid(row=0, column=3, padx=(6, 0))
+
+        ttk.Label(opts, text="INT16_SCALE:").grid(row=0, column=4, sticky="e", padx=(16, 6))
+        self.int16_scale = tk.DoubleVar(value=10000.0)
+        ttk.Entry(opts, textvariable=self.int16_scale, width=10).grid(row=0, column=5, sticky="w")
+
+        # Botones
+        btns = ttk.Frame(left)
+        btns.grid(row=3, column=0, sticky="ew", pady=(6, 0))
+        btns.columnconfigure(0, weight=1)
+        btns.columnconfigure(1, weight=1)
+        btns.columnconfigure(2, weight=1)
+        btns.columnconfigure(3, weight=1)
+
+        ttk.Button(btns, text="Decodificar y graficar", command=self.on_decode).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        ttk.Button(btns, text="Limpiar", command=self.on_clear).grid(row=0, column=1, sticky="ew", padx=(0, 6))
+        ttk.Button(btns, text="Cargar desde archivo .txt", command=self.on_load).grid(row=0, column=2, sticky="ew", padx=(0, 6))
+        ttk.Button(btns, text="Exportar CSV", command=self.on_export_csv).grid(row=0, column=3, sticky="ew")
+
+        # --- Info de header ---
+        info_box = ttk.LabelFrame(left, text="Header decodificado", padding=10)
+        info_box.grid(row=4, column=0, sticky="ew", pady=(10, 0))
+        info_box.columnconfigure(1, weight=1)
+
+        self.info_vars = {}
+        fields = [
+            ("device_id", "Device ID"),
+            ("timestamp", "Timestamp"),
+            ("window_seq", "Window Seq"),
+            ("chunk_seq", "Chunk Seq"),
+            ("fs_hz", "Fs (Hz)"),
+            ("lead_id", "Lead ID"),
+            ("encoding", "Encoding"),
+            ("n_samples", "N samples"),
+            ("sizes", "Sizes (bytes)"),
+            ("scale", "Scale (si int16)"),
+        ]
+        for r, (k, label) in enumerate(fields):
+            ttk.Label(info_box, text=label + ":").grid(row=r, column=0, sticky="w")
+            v = tk.StringVar(value="—")
+            self.info_vars[k] = v
+            ttk.Label(info_box, textvariable=v).grid(row=r, column=1, sticky="w")
+
+        # --- Panel derecho ---
+        right.rowconfigure(0, weight=1)
+        right.rowconfigure(1, weight=0)
+        right.columnconfigure(0, weight=1)
+
+        self.plot_container = ttk.Frame(right)
+        self.plot_container.grid(row=0, column=0, sticky="nsew")
+        self.plot_container.rowconfigure(0, weight=0)  # toolbar
+        self.plot_container.rowconfigure(1, weight=1)  # canvas
+        self.plot_container.columnconfigure(0, weight=1)
+
+        controls = ttk.Frame(right)
+        controls.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        controls.columnconfigure(6, weight=1)
+
+        ttk.Label(controls, text="Mostrar (muestras):").grid(row=0, column=0, sticky="w")
+        self.max_points = tk.IntVar(value=500)
+        ttk.Spinbox(controls, from_=50, to=20000, increment=50, textvariable=self.max_points, width=8,
+                    command=self._refresh_plot).grid(row=0, column=1, sticky="w", padx=(6, 12))
+
+        ttk.Label(controls, text="Offset (muestras):").grid(row=0, column=2, sticky="w")
+        self.offset = tk.IntVar(value=0)
+        ttk.Spinbox(controls, from_=0, to=10000000, increment=50, textvariable=self.offset, width=10,
+                    command=self._refresh_plot).grid(row=0, column=3, sticky="w", padx=(6, 12))
+
+        self.show_time = tk.BooleanVar(value=True)
+        ttk.Checkbutton(controls, text="Eje X en segundos", variable=self.show_time, command=self._refresh_plot).grid(
+            row=0, column=4, sticky="w", padx=(0, 12)
+        )
+
+        ttk.Button(controls, text="Auto-ajustar offset al final", command=self.on_jump_end).grid(
+            row=0, column=5, sticky="w"
+        )
+
+    def _build_plot(self):
+        self.fig = Figure(dpi=100)
+        self.ax = self.fig.add_subplot(111)
+        self.ax.set_title("ECG")
+        self.ax.set_xlabel("t (s)")
+        self.ax.set_ylabel("amplitud")
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self.plot_container)
+
+        canvas_widget = self.canvas.get_tk_widget()
+        canvas_widget.grid(row=1, column=0, sticky="nsew")
+
+        toolbar_frame = ttk.Frame(self.plot_container)
+        toolbar_frame.grid(row=0, column=0, sticky="ew")
+        NavigationToolbar2Tk(self.canvas, toolbar_frame)
+
+        self._clear_plot()
+
+    def _clear_plot(self):
+        self.ax.cla()
+        self.ax.set_title("ECG")
+        self.ax.set_xlabel("t (s)")
+        self.ax.set_ylabel("amplitud")
+        self.ax.grid(True, alpha=0.3)
+        self.canvas.draw_idle()
+
+    def _set_info(self, header):
+        self.info_vars["device_id"].set(f"0x{header['device_id']:08X} ({header['device_id']})")
+        ts = f"{header['year']:04d}-{header['month']:02d}-{header['date']:02d} " \
+             f"{header['hours']:02d}:{header['minutes']:02d}:{header['seconds']:02d}"
+        self.info_vars["timestamp"].set(ts)
+        self.info_vars["window_seq"].set(str(header["window_seq"]))
+        self.info_vars["chunk_seq"].set(str(header["chunk_seq"]))
+        self.info_vars["fs_hz"].set(str(header["fs_hz"]))
+        self.info_vars["lead_id"].set(str(header["lead_id"]))
+
+        enc = header["encoding"]
+        enc_txt = "0=float32" if enc == 0 else ("1=int16" if enc == 1 else str(enc))
+        self.info_vars["encoding"].set(enc_txt)
+
+        self.info_vars["n_samples"].set(str(header["n_samples"]))
+        self.info_vars["sizes"].set(
+            f"total={header['total_bytes']}, header={header['header_bytes']}, data={header['data_bytes']}, extra={header['extra_bytes']}"
+        )
+        self.info_vars["scale"].set("—" if header["scale_used"] is None else str(header["scale_used"]))
+
+    def _refresh_plot(self):
+        if self._samples is None or self._header is None:
+            return
+
+        fs = float(self._header["fs_hz"]) if self._header["fs_hz"] else 1.0
+        y = self._samples
+
+        off = max(0, int(self.offset.get()))
+        nmax = max(1, int(self.max_points.get()))
+        off = min(off, max(0, len(y) - 1))
+        yseg = y[off:off + nmax]
+
+        self.ax.cla()
+        self.ax.set_title(f"ECG (window={self._header['window_seq']}, chunk={self._header['chunk_seq']})")
+
+        if self.show_time.get() and fs > 0:
+            x = (np.arange(len(yseg)) + off) / fs
+            self.ax.set_xlabel("t (s)")
+        else:
+            x = np.arange(len(yseg)) + off
+            self.ax.set_xlabel("índice de muestra")
+
+        self.ax.set_ylabel(self._header.get("y_label", "amplitud"))
+        self.ax.plot(x, yseg)
+        self.ax.grid(True, alpha=0.3)
+        self.canvas.draw_idle()
+
+    # --- callbacks ---
+    def on_decode(self):
+        payload = self.txt.get("1.0", "end").strip()
+        try:
+            header, samples = decode_ecg_payload(
+                payload,
+                mode=self.decode_mode.get(),
+                int16_scale=float(self.int16_scale.get())
+            )
+        except Exception as e:
+            messagebox.showerror("Error al decodificar", str(e))
+            return
+
+        self._header = header
+        self._samples = samples
+
+        self._set_info(header)
+
+        # mostrar todo si es chico, si no un límite razonable
+        self.offset.set(0)
+        self.max_points.set(min(2000, len(samples)))
+        self._refresh_plot()
+
+    def on_clear(self):
+        self.txt.delete("1.0", "end")
+        self._header = None
+        self._samples = None
+        for v in self.info_vars.values():
+            v.set("—")
+        self._clear_plot()
+
+    def on_load(self):
+        path = filedialog.askopenfilename(
+            title="Selecciona un .txt con el payload",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
+        )
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+        except Exception as e:
+            messagebox.showerror("Error al leer archivo", str(e))
+            return
+        self.txt.delete("1.0", "end")
+        self.txt.insert("1.0", content)
+
+    def on_export_csv(self):
+        if self._samples is None or self._header is None:
+            messagebox.showwarning("Sin datos", "Primero decodifica un payload.")
+            return
+
+        path = filedialog.asksaveasfilename(
+            title="Guardar CSV",
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv"), ("All files", "*.*")]
+        )
+        if not path:
+            return
+
+        fs = float(self._header["fs_hz"]) if self._header["fs_hz"] else 0.0
+        h = self._header
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("# device_id,year,month,date,hours,minutes,seconds,window_seq,chunk_seq,fs_hz,lead_id,encoding,n_samples,scale\n")
+                f.write(
+                    f"# {h['device_id']},{h['year']},{h['month']},{h['date']},{h['hours']},{h['minutes']},{h['seconds']},"
+                    f"{h['window_seq']},{h['chunk_seq']},{h['fs_hz']},{h['lead_id']},{h['encoding']},{h['n_samples']},{h.get('scale_used','')}\n"
+                )
+                if fs > 0:
+                    f.write("t_s,value\n")
+                    for i, val in enumerate(self._samples):
+                        f.write(f"{i/fs:.6f},{val:.9g}\n")
+                else:
+                    f.write("index,value\n")
+                    for i, val in enumerate(self._samples):
+                        f.write(f"{i},{val:.9g}\n")
+        except Exception as e:
+            messagebox.showerror("Error exportando CSV", str(e))
+            return
+
+        messagebox.showinfo("CSV guardado", f"Guardado en:\n{path}")
+
+    def on_jump_end(self):
+        if self._samples is None:
+            return
+        nmax = max(1, int(self.max_points.get()))
+        self.offset.set(max(0, len(self._samples) - nmax))
+        self._refresh_plot()
+
+
+if __name__ == "__main__":
+    app = App()
+    app.mainloop()
