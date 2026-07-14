@@ -30,42 +30,41 @@ El sistema completo está dividido en tres capas principales:
 
 ```
                  SEÑAL ECG
-                    │
-                    ▼
-        ┌─────────────────────┐
-        │ Sensor AD8232       │
-        │ Front-End ECG       │
-        └─────────────────────┘
-                    │
-                    ▼
-        ┌─────────────────────┐
-        │ ESP32-S3            │
-        │                     │
-        │ - Adquisición ADC   │
-        │ - Filtrado FIR      │
-        │ - FFT/IFFT          │
-        │ - Buffer circular   │
+                           │
+                          ▼
+        ┌─────────────┐
+        │    Sensor AD8232     │
+        │    Front-End ECG     │
+        └─────────────┘
+                          │
+                         ▼
+        ┌─────────────  ┐
+        │ ESP32-S3                  │
+        │ - Adquisición ADC     │
+        │ - Filtrado FIR             │
+        │ - FFT/IFFT                 │
+        │ - Buffer circular          │
         │ - Empaquetamiento   │
-        └─────────────────────┘
-                    │ UART
-                    ▼
-        ┌─────────────────────┐
-        │ SIM7020E            │
-        │ NB-IoT              │
-        └─────────────────────┘
-                    │ MQTT
-                    ▼
-        ┌─────────────────────┐
-        │ Broker MQTT         │
-        │ Raspberry Pi        │
-        └─────────────────────┘
-                    │
-                    ▼
-        ┌─────────────────────┐
+        └────────────    ┘
+                         │ UART
+                        ▼
+        ┌─────────────┐
+        │         SIM7020E        │
+        │           NB-IoT           │
+        └─────────────┘
+                        │ MQTT
+                       ▼
+        ┌────────────┐
+        │     Broker MQTT    │
+        │      Raspberry Pi    │
+        └────────────┘
+                       │
+                      ▼
+        ┌────────────┐
         │ Servidor Django     │
         │ Base de datos       │
-        │ Visualización ECG   │
-        └─────────────────────┘
+        │ Visualización ECG │
+        └────────────┘
 ```
 
 ---
